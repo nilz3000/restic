@@ -13,6 +13,7 @@ import (
 
 	"github.com/cenkalti/backoff/v4"
 	"github.com/klauspost/compress/zstd"
+	"github.com/nilz3000/gozstd"
 	"github.com/restic/chunker"
 	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/backend/dryrun"
@@ -54,8 +55,6 @@ type Repository struct {
 
 	allocEnc sync.Once
 	allocDec sync.Once
-	enc      *zstd.Encoder
-	dec      *zstd.Decoder
 }
 
 type Options struct {
@@ -316,7 +315,7 @@ func (r *Repository) LoadBlob(ctx context.Context, t restic.BlobType, id restic.
 		}
 
 		if blob.IsCompressed() {
-			plaintext, err = r.getZstdDecoder().DecodeAll(plaintext, make([]byte, 0, blob.DataLength()))
+			plaintext, err = gozstd.Decompress(make([]byte, 0, blob.DataLength()), plaintext)
 			if err != nil {
 				lastError = errors.Errorf("decompressing blob %v failed: %v", id, err)
 				continue
@@ -350,52 +349,6 @@ func (r *Repository) LookupBlobSize(id restic.ID, tpe restic.BlobType) (uint, bo
 	return r.idx.LookupSize(restic.BlobHandle{ID: id, Type: tpe})
 }
 
-func (r *Repository) getZstdEncoder() *zstd.Encoder {
-	r.allocEnc.Do(func() {
-		level := zstd.SpeedDefault
-		if r.opts.Compression == CompressionMax {
-			level = zstd.SpeedBestCompression
-		}
-
-		opts := []zstd.EOption{
-			// Set the compression level configured.
-			zstd.WithEncoderLevel(level),
-			// Disable CRC, we have enough checks in place, makes the
-			// compressed data four bytes shorter.
-			zstd.WithEncoderCRC(false),
-			// Set a window of 512kbyte, so we have good lookbehind for usual
-			// blob sizes.
-			zstd.WithWindowSize(512 * 1024),
-		}
-
-		enc, err := zstd.NewWriter(nil, opts...)
-		if err != nil {
-			panic(err)
-		}
-		r.enc = enc
-	})
-	return r.enc
-}
-
-func (r *Repository) getZstdDecoder() *zstd.Decoder {
-	r.allocDec.Do(func() {
-		opts := []zstd.DOption{
-			// Use all available cores.
-			zstd.WithDecoderConcurrency(0),
-			// Limit the maximum decompressed memory. Set to a very high,
-			// conservative value.
-			zstd.WithDecoderMaxMemory(16 * 1024 * 1024 * 1024),
-		}
-
-		dec, err := zstd.NewReader(nil, opts...)
-		if err != nil {
-			panic(err)
-		}
-		r.dec = dec
-	})
-	return r.dec
-}
-
 // saveAndEncrypt encrypts data and stores it to the backend as type t. If data
 // is small enough, it will be packed together with other small blobs. The
 // caller must ensure that the id matches the data. Returned is the size data
@@ -411,7 +364,7 @@ func (r *Repository) saveAndEncrypt(ctx context.Context, t restic.BlobType, data
 		// compressed.
 		if r.opts.Compression != CompressionOff || t != restic.DataBlob {
 			uncompressedLength = len(data)
-			data = r.getZstdEncoder().EncodeAll(data, nil)
+			data = gozstd.CompressLevel(nil, data, 5)
 		}
 	}
 
@@ -446,7 +399,7 @@ func (r *Repository) compressUnpacked(p []byte) ([]byte, error) {
 
 	// version byte
 	out := []byte{2}
-	out = r.getZstdEncoder().EncodeAll(p, out)
+	out = gozstd.CompressLevel(out, p, 5)
 	return out, nil
 }
 
@@ -468,8 +421,7 @@ func (r *Repository) decompressUnpacked(p []byte) ([]byte, error) {
 	if p[0] != 2 {
 		return nil, errors.New("not supported encoding format")
 	}
-
-	return r.getZstdDecoder().DecodeAll(p[1:], nil)
+	return gozstd.Decompress(nil, p[1:])
 }
 
 // SaveUnpacked encrypts data and stores it in the backend. Returned is the
